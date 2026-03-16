@@ -38,9 +38,17 @@ if st.button("🚀 开始抓取并生成报告"):
     
     chat_messages = []
     try:
+        # 初始化下载器
         downloader = ChatDownloader()
-        # 抓取录播弹幕
-        chat = downloader.get_chat(vod_url, max_messages=max_messages)
+        
+        # 关键修改：添加 quiet=True，禁止它在云端打印终端日志
+        # 如果有些老版本不支持 quiet 参数，我们可以直接给一个空的配置
+        chat = downloader.get_chat(
+            url=vod_url, 
+            max_messages=max_messages,
+            message_groups=['messages'], # 明确只抓取普通弹幕
+            quiet=True # 告诉工具在后台安静运行，不要尝试调用终端画图
+        )
         
         for i, message in enumerate(chat):
             time_str = message.get('time_text', '')
