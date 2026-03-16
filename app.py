@@ -2,73 +2,93 @@ import streamlit as st
 import requests
 import re
 from openai import OpenAI
-import time
 
 st.set_page_config(page_title="Twitch VOD 弹幕 AI 舆情分析", page_icon="🎮", layout="wide")
 
 st.title("🎮 Twitch 录播(VOD) 弹幕舆情分析台")
-st.markdown("通过输入 Twitch VOD 链接，一键抓取历史弹幕，并严格按照《DF海外 KOL 弹幕分析模型》生成结构化舆情报告。")
 
-# ================= 核心抓取逻辑 (Twitch V5 API) =================
+# ================= 核心抓取逻辑 (Twitch GraphQL) =================
 def get_vod_id(url):
     match = re.search(r'videos/(\d+)', url)
     return match.group(1) if match else None
 
-def fetch_twitch_chat_v5(vod_id, max_msgs):
+def fetch_twitch_chat_gql(vod_id, max_msgs):
     """
-    使用更底层的非 GQL 接口抓取 Twitch VOD 弹幕
-    由于 Twitch GQL 经常根据 Client-ID 限制跨域或者部分视频，
-    我们退而求其次，使用更原始、限制更少的 V5 风格接口模拟
+    使用 Twitch GraphQL API 抓取弹幕
+    由于 V5 接口已失效返回 404，我们通过构造 GQL 请求来获取弹幕数据
     """
-    client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko"
-    
+    url = "https://gql.twitch.tv/gql"
     headers = {
-        'Client-ID': client_id,
-        'Accept': 'application/vnd.twitchtv.v5+json'
+        "Client-Id": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     
     messages = []
     cursor = None
     
-    # 每次请求大概返回 50-100 条数据
     max_loops = (int(max_msgs) // 50) + 10
     
     for _ in range(max_loops):
-        # 构建 V5 请求 URL
-        base_url = f"https://api.twitch.tv/v5/videos/{vod_id}/comments"
-        url = f"{base_url}?cursor={cursor}" if cursor else base_url
+        if not cursor:
+            variables = {"videoID": vod_id, "contentOffsetSeconds": 0.0}
+        else:
+            variables = {"videoID": vod_id, "cursor": cursor}
+            
+        payload = [
+            {
+                "operationName": "VideoCommentsByOffsetOrCursor",
+                "variables": variables,
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
+                    }
+                }
+            }
+        ]
         
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
         except Exception as e:
             raise Exception(f"网络请求失败: {e}")
             
         if response.status_code != 200:
-            raise Exception(f"Twitch API 拒绝连接: HTTP {response.status_code}。请确认视频是否属于订阅者专享(Sub-only)或已被删除。")
+            raise Exception(f"Twitch API 拒绝连接: HTTP {response.status_code}。请确认视频是否存在。")
             
         try:
-            data = response.json()
+            data = response.json()[0]
         except:
-            raise Exception("Twitch 返回数据格式异常。")
-            
-        comments = data.get("comments", [])
-        if not comments:
             break
             
-        for comment in comments:
+        video_data = data.get("data", {}).get("video")
+        if not video_data:
+            raise Exception(f"未能获取到视频数据。请确认视频是否属于订阅者专享(Sub-only)或已被删除。")
+            
+        comments_data = video_data.get("comments")
+        if not comments_data:
+            break
+            
+        edges = comments_data.get("edges", [])
+        if not edges:
+            break
+            
+        for edge in edges:
+            node = edge.get("node", {})
+            
             # 解析时间
-            offset = comment.get("content_offset_seconds", 0)
+            offset = node.get("contentOffsetSeconds", 0)
             m, s = divmod(int(offset), 60)
             h, m = divmod(m, 60)
             time_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
             
             # 解析作者
-            commenter = comment.get("commenter", {})
-            author = commenter.get("display_name", "Unknown") if commenter else "Unknown"
+            commenter = node.get("commenter")
+            author = commenter.get("displayName", "Unknown") if commenter else "Unknown"
             
             # 解析消息体
-            message_obj = comment.get("message", {})
-            body = message_obj.get("body", "")
+            fragments = node.get("message", {}).get("fragments", [])
+            body = "".join(f.get("text", "") for f in fragments)
             
             if len(body.strip()) > 1:
                 messages.append(f"[{time_str}] {author}: {body}")
@@ -77,45 +97,38 @@ def fetch_twitch_chat_v5(vod_id, max_msgs):
                 return messages
                 
         # 获取下一页游标
-        cursor = data.get("_next")
-        if not cursor:
+        has_next = comments_data.get("pageInfo", {}).get("hasNextPage")
+        if not has_next:
             break
             
-        time.sleep(0.1)  # 防封控短暂停顿
+        cursor = edges[-1].get("cursor")
+        if not cursor:
+            break
             
     return messages
 
 # ================= 界面与交互 =================
 with st.sidebar:
     st.header("⚙️ 全局设置")
-    default_key = st.secrets.get("OPENAI_API_KEY", "")
+    default_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets else ""
     openai_api_key = st.text_input("填入你的 OpenAI API Key", value=default_key, type="password")
     model_choice = st.selectbox("选择大模型版本", ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"])
-    st.markdown("---")
-    st.markdown("### 📝 内置分析模板")
-    st.info("已完全对齐《xQc弹幕分析》报告标准：\n1. 核心结论提取\n2. 观点分布与二级表达结构\n3. 弹幕结构总结\n4. 主播四象限归类 (玩法/情绪驱动)")
 
 vod_url = st.text_input("📺 输入 Twitch VOD 链接 (例如: https://www.twitch.tv/videos/2723303877)")
-max_messages = st.number_input("📥 抓取弹幕数量上限", min_value=100, max_value=50000, value=8000, step=1000)
+max_messages = st.number_input("📥 抓取上限", min_value=100, max_value=50000, value=8000, step=1000)
 
 if st.button("🚀 开始抓取并生成报告"):
-    if not openai_api_key:
-        st.error("请先在左侧配置 OpenAI API Key！")
-        st.stop()
-        
     vod_id = get_vod_id(vod_url)
     if not vod_id:
         st.error("无法识别 VOD ID，请确认链接格式。")
         st.stop()
-
-    client = OpenAI(api_key=openai_api_key)
 
     # ================= 阶段 1：扒取弹幕 =================
     st.subheader("1️⃣ 正在抓取 Twitch 弹幕...")
     
     with st.spinner("正在使用底层接口提取弹幕..."):
         try:
-            chat_messages = fetch_twitch_chat_v5(vod_id, max_messages)
+            chat_messages = fetch_twitch_chat_gql(vod_id, max_messages)
             if len(chat_messages) > 0:
                 st.success(f"✅ 成功抓取了 {len(chat_messages)} 条弹幕数据！")
         except Exception as e:
@@ -123,7 +136,7 @@ if st.button("🚀 开始抓取并生成报告"):
             st.stop()
 
     if len(chat_messages) == 0:
-        st.warning(f"视频 {vod_id} 提取到的弹幕数为 0。\n可能的原因：\n1. 视频太老，弹幕记录已被 Twitch 清理\n2. 该主播设置了【仅订阅者(Sub-only)可见】\n3. 视频本身没有任何聊天记录。")
+        st.warning(f"视频 {vod_id} 提取到的弹幕数为 0。\n可能的原因：\n1. 这是无弹幕的视频\n2. 该主播设置了【仅订阅者(Sub-only)可见VOD】\n3. 视频太老，弹幕记录已被 Twitch 清理。")
         st.stop()
 
     raw_chat_text = "\n".join(chat_messages)
@@ -165,7 +178,6 @@ if st.button("🚀 开始抓取并生成报告"):
     1. [类型1，如煽动型]：[列举2-3条典型原声弹幕]
     2. [类型2，如吐槽型]：[列举2-3条典型原声弹幕]
   * **观察：** [深度分析该观点的互动特征]
-*(继续列举观点二、观点三...)*
 
 **弹幕结构总结：**
 [一句话总结，例如：整体呈现 娱乐事件驱动 >> Gameplay讨论 的特征]
@@ -177,6 +189,7 @@ if st.button("🚀 开始抓取并生成报告"):
 * **典型弹幕：** [列举该象限的标志性弹幕]
 """
     
+    client = OpenAI(api_key=openai_api_key)
     user_prompt = f"以下是该 VOD 的弹幕记录采样：\n\n{raw_chat_text[:80000]}"
 
     try:
@@ -193,16 +206,7 @@ if st.button("🚀 开始抓取并生成报告"):
             
         analysis_result = response.choices[0].message.content
         st.success("✅ 舆情报告生成完毕！")
-        
-        st.markdown("---")
         st.markdown(analysis_result)
-        
-        st.download_button(
-            label="📄 下载舆情分析报告 (Markdown)",
-            data=analysis_result,
-            file_name=f"Twitch_Analysis_{vod_id}.md",
-            mime="text/markdown"
-        )
         
     except Exception as e:
         st.error(f"AI 分析阶段报错: {str(e)}")
