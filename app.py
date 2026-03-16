@@ -53,8 +53,8 @@ if st.button("🚀 开始抓取并生成报告"):
         # 初始化下载器
         downloader = ChatDownloader()
         
-        # 抓取录播弹幕，加上 quiet=True 尝试让工具本身保持安静
-        chat = downloader.get_chat(vod_url, max_messages=max_messages, quiet=True)
+        # 删除不支持的 quiet 参数，依靠外层的 sys.stdout 重定向来保持安静
+        chat = downloader.get_chat(vod_url, max_messages=max_messages)
         
         for i, message in enumerate(chat):
             # 获取文本前，先屏蔽输出
