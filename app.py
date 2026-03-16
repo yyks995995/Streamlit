@@ -40,46 +40,35 @@ if st.button("🚀 开始抓取并生成报告"):
     status_text = st.empty()
     
     chat_messages = []
-    
-    # 强制将系统的标准输出和错误输出重定向到 devnull（黑洞），避免库底层调用终端宽度接口报错
-    devnull = open(os.devnull, 'w')
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    
     try:
-        sys.stdout = devnull
-        sys.stderr = devnull
+        # 1. 临时“欺骗” chat-downloader，告诉它不要尝试画进度条
+        import os
+        os.environ['CHAT_DOWNLOADER_QUIET'] = '1'
         
-        # 初始化下载器
+        # 2. 初始化下载器
         downloader = ChatDownloader()
         
-        # 删除不支持的 quiet 参数，依靠外层的 sys.stdout 重定向来保持安静
+        # 3. 使用底层的 create_session 避免触发上层的格式化打印逻辑
         chat = downloader.get_chat(vod_url, max_messages=max_messages)
         
         for i, message in enumerate(chat):
-            # 获取文本前，先屏蔽输出
-            sys.stdout = devnull
-            sys.stderr = devnull
-            
             time_str = message.get('time_text', '')
             author = message.get('author', {}).get('name', 'Unknown')
             text = message.get('message', '')
             
-            # 过滤掉极短的纯符号，保留有意义的文本
+            # 过滤短文本
             if len(text.strip()) > 1:
                 chat_messages.append(f"[{time_str}] {author}: {text}")
             
-            # 需要更新 Streamlit 界面时，短暂恢复输出流
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-            
+            # 更新界面进度
             if i % 100 == 0:
-                # 防止由于数据稍多导致进度条超出 1.0 报错
                 current_progress = min(i / max_messages, 1.0)
                 progress_bar.progress(current_progress)
                 status_text.text(f"已抓取 {i} 条有效弹幕...")
                 
-        # 抓取正常结束，彻底恢复输出流
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ 成功提取 {len(chat_messages)} 条有效弹幕！")
+
         sys.stdout = old_stdout
         sys.stderr = old_stderr
         
@@ -87,10 +76,6 @@ if st.button("🚀 开始抓取并生成报告"):
         status_text.text(f"✅ 成功提取 {len(chat_messages)} 条有效弹幕！")
         
     except Exception as e:
-        # 发生异常时，首先一定要恢复输出流，否则连报错信息都打印不出来
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        devnull.close()
         st.error(f"抓取失败，请检查链接是否有效: {str(e)}")
         st.stop()
     finally:
