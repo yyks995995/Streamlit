@@ -1,0 +1,3 @@
+streamlit
+chat-downloader
+openai
