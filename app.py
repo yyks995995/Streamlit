@@ -2,25 +2,26 @@ import streamlit as st
 from chat_downloader import ChatDownloader
 from openai import OpenAI
 import os
-import sys
 
 st.set_page_config(page_title="Twitch VOD 弹幕 AI 舆情分析", page_icon="🎮", layout="wide")
 
 st.title("🎮 Twitch 录播(VOD) 弹幕舆情分析台")
 st.markdown("通过输入 Twitch VOD 链接，一键抓取历史弹幕，并严格按照《DF海外 KOL 弹幕分析模型》生成结构化舆情报告。")
 
-# 侧边栏：配置信息
+# ================= 侧边栏配置 =================
 with st.sidebar:
     st.header("⚙️ 全局设置")
-    # 优先从后台 Secrets 读取，如果没有再让用户手动输入
-    default_key = st.secrets["OPENAI_API_KEY"] if "OPENAI_API_KEY" in st.secrets else ""
+    
+    # 支持在 Streamlit Cloud 后台配置 Secrets 隐藏 API Key
+    default_key = st.secrets.get("OPENAI_API_KEY", "")
     openai_api_key = st.text_input("填入你的 OpenAI API Key", value=default_key, type="password")
+    
     model_choice = st.selectbox("选择大模型版本", ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"])
     st.markdown("---")
     st.markdown("### 📝 内置分析模板")
     st.info("已完全对齐《xQc弹幕分析》报告标准：\n1. 核心结论提取\n2. 观点分布与二级表达结构\n3. 弹幕结构总结\n4. 主播四象限归类 (玩法/情绪驱动)")
 
-# 主界面：输入区
+# ================= 主界面输入 =================
 vod_url = st.text_input("📺 输入 Twitch VOD 链接 (例如: https://www.twitch.tv/videos/123456789)")
 max_messages = st.number_input("📥 抓取弹幕数量上限 (建议 5000-10000 避免超出大模型理解上限)", min_value=100, max_value=50000, value=8000, step=1000)
 
@@ -40,24 +41,33 @@ if st.button("🚀 开始抓取并生成报告"):
     status_text = st.empty()
     
     chat_messages = []
+    
+    # 【终极防报错黑科技】欺骗底层库，让它以为这就是一个普通的文本输出环境，别去画花里胡哨的进度条
+    os.environ['CHAT_DOWNLOADER_QUIET'] = '1'
+    os.environ['COLUMNS'] = '80'
+    os.environ['LINES'] = '24'
+
     try:
-        # 1. 临时“欺骗” chat-downloader，告诉它不要尝试画进度条
-        import os
-        os.environ['CHAT_DOWNLOADER_QUIET'] = '1'
-        
-        # 2. 初始化下载器
+        # 使用最基础的初始化方式
         downloader = ChatDownloader()
         
-        # 3. 使用底层的 create_session 避免触发上层的格式化打印逻辑
-        chat = downloader.get_chat(vod_url, max_messages=max_messages)
+        # 只抓取普通消息，忽略那些导致库崩溃的复杂系统消息或订阅动画
+        chat = downloader.get_chat(
+            vod_url, 
+            message_groups=['messages']
+        )
         
+        # 为了防止它无限卡住，手动控制抓取数量
         for i, message in enumerate(chat):
+            if i >= max_messages:
+                break
+                
             time_str = message.get('time_text', '')
             author = message.get('author', {}).get('name', 'Unknown')
             text = message.get('message', '')
             
             # 过滤短文本
-            if len(text.strip()) > 1:
+            if text and len(text.strip()) > 1:
                 chat_messages.append(f"[{time_str}] {author}: {text}")
             
             # 更新界面进度
@@ -68,29 +78,15 @@ if st.button("🚀 开始抓取并生成报告"):
                 
         progress_bar.progress(1.0)
         status_text.text(f"✅ 成功提取 {len(chat_messages)} 条有效弹幕！")
-
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ 成功提取 {len(chat_messages)} 条有效弹幕！")
         
     except Exception as e:
-        st.error(f"抓取失败，请检查链接是否有效: {str(e)}")
+        st.error(f"抓取失败，请检查链接是否有效 (请确保是 Twitch 录播视频且未被隐藏): {str(e)}")
         st.stop()
-    finally:
-        # 确保 devnull 文件句柄被正确关闭
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        if not devnull.closed:
-            devnull.close()
 
-    # 检查是否成功抓到了数据
     if len(chat_messages) == 0:
-        st.warning("抓取完成，但未提取到任何弹幕。可能是因为该视频没有聊天记录，或格式不兼容。")
+        st.warning("抓取完成，但未提取到任何弹幕。可能是视频没开弹幕或不支持抓取。")
         st.stop()
 
-    # 提供原文本下载
     raw_chat_text = "\n".join(chat_messages)
     st.download_button(
         label="📥 下载原始弹幕 (TXT文本)",
@@ -102,7 +98,6 @@ if st.button("🚀 开始抓取并生成报告"):
     # ================= 阶段 2：AI 舆情分析 =================
     st.subheader("2️⃣ ChatGPT 深度分析中 (严格遵循内置模板)...")
     
-    # 将你的 PDF 报告结构硬编码入 AI 的系统提示词中
     system_prompt = """你是一个专业的游戏行业 KOL 舆情分析专家。
 你的任务是根据用户提供的 Twitch 录播弹幕（Chat Logs），严格按照提供的专业模板输出舆情分析报告。请保持客观、专业。
 
@@ -143,18 +138,17 @@ if st.button("🚀 开始抓取并生成报告"):
 * **典型弹幕：** [列举该象限的标志性弹幕]
 """
     
-    # 截断以防超出 Token 限制 (保留约 10万字符，对大模型绰绰有余)
-    user_prompt = f"以下是该 VOD 的弹幕记录采样：\n\n{raw_chat_text[:100000]}"
+    user_prompt = f"以下是该 VOD 的弹幕记录采样：\n\n{raw_chat_text[:80000]}"
 
     try:
-        with st.spinner("AI 正在根据四象限模型和核心观点进行拆解，请稍等 1-2 分钟..."):
+        with st.spinner("AI 正在根据四象限模型和核心观点进行拆解，请稍等 1 分钟..."):
             response = client.chat.completions.create(
                 model=model_choice,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.4, # 较低温度保证分析格式的严谨性
+                temperature=0.4,
                 max_tokens=3000
             )
             
@@ -165,7 +159,7 @@ if st.button("🚀 开始抓取并生成报告"):
         st.markdown(analysis_result)
         
         st.download_button(
-            label="📄 下载舆情分析报告 (Markdown / 可转 Word)",
+            label="📄 下载舆情分析报告 (Markdown)",
             data=analysis_result,
             file_name="Twitch_Chat_Analysis_Report.md",
             mime="text/markdown"
