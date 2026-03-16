@@ -2,6 +2,7 @@ import streamlit as st
 from chat_downloader import ChatDownloader
 from openai import OpenAI
 import os
+import sys
 
 st.set_page_config(page_title="Twitch VOD 弹幕 AI 舆情分析", page_icon="🎮", layout="wide")
 
@@ -37,34 +38,40 @@ if st.button("🚀 开始抓取并生成报告"):
     status_text = st.empty()
     
     chat_messages = []
-    try:
-        # 初始化下载器
-        downloader = ChatDownloader()
+try:
+        # 强行屏蔽标准输出，防止 Inappropriate ioctl for device 报错
+        sys.stdout = open(os.devnull, 'w')
         
-        # 关键修改：添加 quiet=True，禁止它在云端打印终端日志
-        # 如果有些老版本不支持 quiet 参数，我们可以直接给一个空的配置
-        chat = downloader.get_chat(
-            url=vod_url, 
-            max_messages=max_messages,
-            message_groups=['messages'], # 明确只抓取普通弹幕
-            quiet=True # 告诉工具在后台安静运行，不要尝试调用终端画图
-        )
+        downloader = ChatDownloader()
+        # 抓取录播弹幕
+        chat = downloader.get_chat(vod_url, max_messages=max_messages)
         
         for i, message in enumerate(chat):
             time_str = message.get('time_text', '')
             author = message.get('author', {}).get('name', 'Unknown')
             text = message.get('message', '')
+            
             # 过滤掉极短的纯符号，保留有意义的文本
             if len(text.strip()) > 1:
                 chat_messages.append(f"[{time_str}] {author}: {text}")
             
+            # 恢复标准输出以更新进度条
+            sys.stdout = sys.__stdout__
             if i % 100 == 0:
                 progress_bar.progress(min(i / max_messages, 1.0))
                 status_text.text(f"已抓取 {i} 条有效弹幕...")
+            # 再次屏蔽输出给下一次循环使用
+            sys.stdout = open(os.devnull, 'w')
                 
+        # 抓取结束后，彻底恢复标准输出
+        sys.stdout = sys.__stdout__
+        
         progress_bar.progress(1.0)
         status_text.text(f"✅ 成功提取 {len(chat_messages)} 条弹幕！")
-    except Exception as e:
+    
+except Exception as e:
+        # 确保报错时输出流是正常的
+        sys.stdout = sys.__stdout__
         st.error(f"抓取失败，请检查链接是否有效: {str(e)}")
         st.stop()
 
