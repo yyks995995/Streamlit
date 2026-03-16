@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import re
 from openai import OpenAI
+import time
 
 st.set_page_config(page_title="Twitch VOD 弹幕 AI 舆情分析", page_icon="🎮", layout="wide")
 
@@ -18,23 +19,24 @@ with st.sidebar:
     st.markdown("### 📝 内置分析模板")
     st.info("已完全对齐《xQc弹幕分析》报告标准：\n1. 核心结论提取\n2. 观点分布与二级表达结构\n3. 弹幕结构总结\n4. 主播四象限归类 (玩法/情绪驱动)")
 
-# ================= 核心抓取逻辑 (Twitch GQL API) =================
+# ================= 核心抓取逻辑 =================
 def get_vod_id(url):
     """从链接中提取 VOD ID"""
     match = re.search(r'videos/(\d+)', url)
     return match.group(1) if match else None
 
 def fetch_twitch_chat(vod_id, max_msgs):
-    """直接请求 Twitch API，彻底绕开任何第三方库和终端环境限制"""
-    # Twitch Public Client ID (公开通用的)
-    client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko" 
+    """使用 Twitch GQL API 抓取弹幕（修复 Client ID 和校验）"""
+    # Twitch GQL 公共 Client ID（非常稳定）
+    client_id = "kimne78kx3ncx6brgo4mv6wki5h1ko"
     
     headers = {
         'Client-ID': client_id,
-        'Content-Type': 'text/plain;charset=UTF-8'
+        'Content-Type': 'text/plain;charset=UTF-8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
-    
-    # 构造请求数据 (模拟网页端请求)
+
+    # 这是 Twitch 获取录播弹幕专用的 Hash
     payload = [{
         "operationName": "VideoCommentsByOffsetOrCursor",
         "variables": {
@@ -52,11 +54,10 @@ def fetch_twitch_chat(vod_id, max_msgs):
     messages = []
     cursor = None
     
-    # 一次请求大概返回 40-50 条，设定上限循环防止死循环
-    max_loops = (int(max_msgs) // 40) + 5
+    # 防止死循环，设定安全上限
+    max_loops = (int(max_msgs) // 40) + 10
     
     for _ in range(max_loops):
-        # 翻页逻辑：如果有游标，则使用游标
         if cursor:
             payload[0]["variables"]["cursor"] = cursor
             if "contentOffsetSeconds" in payload[0]["variables"]:
@@ -64,55 +65,77 @@ def fetch_twitch_chat(vod_id, max_msgs):
                 
         try:
             response = requests.post("https://gql.twitch.tv/gql", headers=headers, json=payload, timeout=10)
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"网络连接出错: {str(e)}")
+        except Exception as e:
+            raise Exception(f"网络请求失败: {e}")
             
         if response.status_code != 200:
-            raise Exception(f"Twitch 接口拒绝请求: {response.status_code}")
+            raise Exception(f"Twitch 返回错误状态码: {response.status_code}")
             
-        json_data = response.json()
-        if not json_data or "data" not in json_data[0]:
+        try:
+            json_data = response.json()
+        except:
+            raise Exception("Twitch 返回了非 JSON 格式的数据，可能是反爬策略拦截。")
+            
+        # 逐层安全解析，防止 KeyError 或层级不匹配
+        if not json_data or not isinstance(json_data, list):
             break
             
-        data_body = json_data[0]["data"].get("video")
-        if not data_body or not data_body.get("comments"):
+        data = json_data[0].get("data")
+        if not data:
             break
             
-        comments = data_body["comments"]["edges"]
+        video = data.get("video")
+        if not video:
+            raise Exception("找不到该视频数据，可能是视频已被删除、设为私密或需要订阅者权限。")
+            
+        comments = video.get("comments")
         if not comments:
             break
             
-        for edge in comments:
+        edges = comments.get("edges", [])
+        if not edges:
+            break
+            
+        for edge in edges:
             node = edge.get("node", {})
+            message = node.get("message", {})
             
-            # 提取时间
-            content_offset = node.get("contentOffsetSeconds", 0)
-            m, s = divmod(content_offset, 60)
+            # 解析时间
+            offset = node.get("contentOffsetSeconds", 0)
+            m, s = divmod(offset, 60)
             h, m = divmod(m, 60)
-            time_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+            time_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
             
-            # 提取用户名
+            # 解析作者
             author = "Unknown"
-            if node.get("commenter") and node["commenter"].get("displayName"):
-                author = node["commenter"]["displayName"]
+            commenter = node.get("commenter")
+            if commenter:
+                author = commenter.get("displayName", "Unknown")
                 
-            # 提取消息文本内容（包含表情和文字片段拼接）
-            text_fragments = node.get("message", {}).get("fragments", [])
-            text = "".join([frag.get("text", "") for frag in text_fragments if frag.get("text")])
+            # 解析消息内容（由于包含表情，Twitch 会把它切成 fragments）
+            fragments = message.get("fragments", [])
+            text_parts = []
+            for frag in fragments:
+                if frag and "text" in frag:
+                    text_parts.append(frag["text"])
             
-            # 过滤垃圾信息
-            if len(text.strip()) > 1:
-                messages.append(f"[{time_str}] {author}: {text}")
+            full_text = "".join(text_parts).strip()
+            
+            # 保存非空弹幕
+            if full_text:
+                messages.append(f"[{time_str}] {author}: {full_text}")
                 
             if len(messages) >= max_msgs:
                 return messages
                 
-        # 获取下一页游标以供翻页
-        page_info = data_body["comments"].get("pageInfo", {})
-        if page_info.get("hasNextPage") and comments:
-            cursor = comments[-1].get("cursor")
+        # 翻页
+        page_info = comments.get("pageInfo", {})
+        if page_info.get("hasNextPage") and edges:
+            cursor = edges[-1].get("cursor")
         else:
             break
+            
+        time.sleep(0.1) # 稍微喘口气，防止被 Twitch 屏蔽
             
     return messages
 
@@ -130,7 +153,7 @@ if st.button("🚀 开始抓取并生成报告"):
 
     vod_id = get_vod_id(vod_url)
     if not vod_id:
-        st.error("无法从链接中识别 VOD ID，请确认链接格式。格式应包含 /videos/后面接数字。")
+        st.error("无法从链接中识别 VOD ID，请确认链接格式包含 /videos/后面接数字。")
         st.stop()
 
     client = OpenAI(api_key=openai_api_key)
@@ -138,16 +161,17 @@ if st.button("🚀 开始抓取并生成报告"):
     # ================= 阶段 1：扒取弹幕 =================
     st.subheader("1️⃣ 正在抓取 Twitch 弹幕...")
     
-    with st.spinner(f"正在通过原生的 GraphQL API 从视频 {vod_id} 抽取数据，这需要十几秒，请耐心等待..."):
+    with st.spinner(f"正在从视频 {vod_id} 抽取数据，纯后台网络请求中，请等待十几秒..."):
         try:
             chat_messages = fetch_twitch_chat(vod_id, max_messages)
-            st.success(f"✅ 成功抓取了 {len(chat_messages)} 条有效弹幕数据！")
+            if len(chat_messages) > 0:
+                st.success(f"✅ 成功抓取了 {len(chat_messages)} 条有效弹幕数据！")
         except Exception as e:
-            st.error(f"网络抓取失败: {str(e)}")
+            st.error(f"抓取中断: {str(e)}")
             st.stop()
 
     if len(chat_messages) == 0:
-        st.warning("抓取完成，但未提取到任何弹幕。可能是该视频未开启弹幕或被设为仅订阅者可见。")
+        st.warning("抓取完成，但未提取到任何弹幕。如果网页上有弹幕，可能是因为视频属于“Sub-only (仅订阅者可见)”模式，公共 API 无法绕过权限。")
         st.stop()
 
     raw_chat_text = "\n".join(chat_messages)
